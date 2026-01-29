@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Vercel
+.vercel
+
+# Testing
+verify_connection.py
+
