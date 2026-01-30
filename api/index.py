@@ -5,25 +5,25 @@ from typing import Optional
 from supabase import create_client, Client
 import os
 
-# Initialize Supabase
+# Initialize Supabase clients
 url = os.environ.get("SUPABASE_URL")
-key = os.environ.get("SUPABASE_KEY")
+anon_key = os.environ.get("SUPABASE_KEY")  # For auth verification
+service_role_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")  # For DB operations
 
-if url and key:
-    supabase: Client = create_client(url, key)
+# Client for auth verification (anon key)
+if url and anon_key:
+    supabase: Client = create_client(url, anon_key)
 else:
     supabase = None
 
-
-def get_user_client(token: str) -> Client:
-    """Create a Supabase client authenticated with the user's token for RLS."""
-    if not url or not key:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    
-    client = create_client(url, key)
-    # Set the user's access token for RLS context
-    client.auth.set_session(token, token)
-    return client
+# Admin client for DB operations (service role key - bypasses RLS)
+if url and service_role_key:
+    supabase_admin: Client = create_client(url, service_role_key)
+elif url and anon_key:
+    # Fallback to anon key if service role not set
+    supabase_admin = supabase
+else:
+    supabase_admin = None
 
 
 # ===== MODELS =====
@@ -63,7 +63,11 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "supabase_connected": supabase is not None}
+    return {
+        "status": "ok", 
+        "supabase_connected": supabase is not None,
+        "service_role_enabled": supabase_admin is not supabase
+    }
 
 
 # ===== AUTH PROFILE ENDPOINTS =====
@@ -72,9 +76,9 @@ def health_check():
 def complete_profile(profile_data: CompleteProfileRequest, authorization: str = Header(...)):
     """
     Complete user profile after first login.
-    Uses user's token for RLS context.
+    Uses anon key to verify user token, then service_role key to insert (bypasses RLS).
     """
-    if not supabase:
+    if not supabase or not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     
     valid_roles = ['elderly', 'family_supervisor', 'professional']
@@ -87,21 +91,18 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
     token = authorization.replace("Bearer ", "")
     
     try:
-        # Verify user token
+        # 1. Verify user token with anon key
         user_response = supabase.auth.get_user(token)
         user = user_response.user
         if not user:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        # Create user-authenticated client for RLS
-        user_client = get_user_client(token)
-        
-        # Check if profile already exists
-        existing = user_client.table("users").select("*").eq("id", user.id).execute()
+        # 2. Check if profile already exists (using admin to bypass RLS)
+        existing = supabase_admin.table("users").select("*").eq("id", user.id).execute()
         if existing.data and len(existing.data) > 0:
             raise HTTPException(status_code=400, detail="Profile already exists")
         
-        # Get metadata from Google OAuth
+        # 3. Prepare new user data
         metadata = user.user_metadata or {}
         new_user = {
             "id": user.id,
@@ -112,8 +113,8 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
             "role": profile_data.role
         }
         
-        # Insert with user's RLS context
-        result = user_client.table("users").insert(new_user).execute()
+        # 4. Insert using service_role key (bypasses RLS)
+        result = supabase_admin.table("users").insert(new_user).execute()
         
         if not result.data:
             raise HTTPException(status_code=500, detail="Failed to create profile")
@@ -136,7 +137,7 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
 @app.get("/auth/me", response_model=UserProfile)
 def get_me(authorization: str = Header(...)):
     """Get current authenticated user's profile."""
-    if not supabase:
+    if not supabase or not supabase_admin:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     
     if not authorization.startswith("Bearer "):
@@ -145,15 +146,14 @@ def get_me(authorization: str = Header(...)):
     token = authorization.replace("Bearer ", "")
     
     try:
+        # Verify user token
         user_response = supabase.auth.get_user(token)
         user = user_response.user
         if not user:
             raise HTTPException(status_code=401, detail="Invalid token")
         
-        # Create user-authenticated client for RLS
-        user_client = get_user_client(token)
-        
-        result = user_client.table("users").select("*").eq("id", user.id).execute()
+        # Get profile using admin client
+        result = supabase_admin.table("users").select("*").eq("id", user.id).execute()
         if not result.data or len(result.data) == 0:
             raise HTTPException(status_code=404, detail="Profile not found")
         
