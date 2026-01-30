@@ -17,27 +17,6 @@ else:
 
 # ===== MODELS =====
 
-class AuthResponse(BaseModel):
-    url: str
-
-
-class TokenRequest(BaseModel):
-    access_token: str
-
-
-class GoogleUserData(BaseModel):
-    id: str
-    email: str
-    full_name: Optional[str] = None
-    avatar_url: Optional[str] = None
-
-
-class LoginResponse(BaseModel):
-    user: GoogleUserData
-    needs_onboarding: bool
-    profile: Optional[dict] = None
-
-
 class CompleteProfileRequest(BaseModel):
     full_name: str
     role: str
@@ -54,16 +33,6 @@ class UserProfile(BaseModel):
 
 
 # ===== HELPERS =====
-
-def extract_google_metadata(user) -> GoogleUserData:
-    metadata = user.user_metadata or {}
-    return GoogleUserData(
-        id=user.id,
-        email=user.email,
-        full_name=metadata.get("full_name") or metadata.get("name"),
-        avatar_url=metadata.get("avatar_url") or metadata.get("picture")
-    )
-
 
 def get_user_profile(user_id: str) -> Optional[dict]:
     if not supabase:
@@ -118,47 +87,16 @@ def health_check():
     return {"status": "ok", "supabase_connected": supabase is not None}
 
 
-@app.get("/auth/login/google", response_model=AuthResponse)
-def login_with_google(redirect_to: Optional[str] = None):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    # Use the mobile app deep link as default for proper OAuth callback
-    # The app will handle the token extraction from the URL fragment
-    callback_url = redirect_to or "frontend://auth/callback"
-    response = supabase.auth.sign_in_with_oauth({
-        "provider": "google",
-        "options": {"redirect_to": callback_url}
-    })
-    return {"url": response.url}
-
-
-@app.get("/auth/callback")
-def auth_callback(code: Optional[str] = None, error: Optional[str] = None):
-    if error:
-        raise HTTPException(status_code=400, detail=error)
-    if not code:
-        raise HTTPException(status_code=400, detail="No authorization code provided")
-    return {"message": "Authentication successful", "code": code}
-
-
-@app.post("/auth/verify", response_model=LoginResponse)
-def verify_token(token_request: TokenRequest):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    try:
-        user_response = supabase.auth.get_user(token_request.access_token)
-        user = user_response.user
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        google_data = extract_google_metadata(user)
-        profile = get_user_profile(user.id)
-        return LoginResponse(user=google_data, needs_onboarding=profile is None, profile=profile)
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
-
+# ===== AUTH PROFILE ENDPOINTS =====
+# OAuth is now handled natively in the mobile app via Supabase SDK
+# These endpoints remain for profile management after authentication
 
 @app.post("/auth/complete-profile", response_model=UserProfile)
 def complete_profile(profile_data: CompleteProfileRequest, authorization: str = Header(...)):
+    """
+    Complete user profile after first login.
+    Called from the mobile app after user authenticates with Google.
+    """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
     valid_roles = ['elderly', 'family_supervisor', 'professional']
@@ -175,12 +113,14 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
         existing = get_user_profile(user.id)
         if existing:
             raise HTTPException(status_code=400, detail="Profile already exists")
-        google_data = extract_google_metadata(user)
+        
+        # Get metadata from Google OAuth
+        metadata = user.user_metadata or {}
         new_user = {
             "id": user.id,
             "email": user.email,
             "full_name": profile_data.full_name,
-            "avatar_url": google_data.avatar_url,
+            "avatar_url": metadata.get("avatar_url") or metadata.get("picture"),
             "phone": profile_data.phone,
             "role": profile_data.role
         }
@@ -204,6 +144,7 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
 
 @app.get("/auth/me", response_model=UserProfile)
 def get_me(current_user=Depends(get_current_user)):
+    """Get current authenticated user's profile."""
     return UserProfile(
         id=current_user["id"],
         email=current_user["email"],
