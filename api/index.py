@@ -122,7 +122,9 @@ def health_check():
 def login_with_google(redirect_to: Optional[str] = None):
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
-    callback_url = redirect_to or "https://carenetapi.vercel.app/auth/callback"
+    # Use the mobile app deep link as default for proper OAuth callback
+    # The app will handle the token extraction from the URL fragment
+    callback_url = redirect_to or "frontend://auth/callback"
     response = supabase.auth.sign_in_with_oauth({
         "provider": "google",
         "options": {"redirect_to": callback_url}
