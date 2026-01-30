@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -13,6 +13,17 @@ if url and key:
     supabase: Client = create_client(url, key)
 else:
     supabase = None
+
+
+def get_user_client(token: str) -> Client:
+    """Create a Supabase client authenticated with the user's token for RLS."""
+    if not url or not key:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    client = create_client(url, key)
+    # Set the user's access token for RLS context
+    client.auth.set_session(token, token)
+    return client
 
 
 # ===== MODELS =====
@@ -30,38 +41,6 @@ class UserProfile(BaseModel):
     avatar_url: Optional[str]
     phone: Optional[str]
     role: str
-
-
-# ===== HELPERS =====
-
-def get_user_profile(user_id: str) -> Optional[dict]:
-    if not supabase:
-        return None
-    result = supabase.table("users").select("*").eq("id", user_id).execute()
-    if result.data and len(result.data) > 0:
-        return result.data[0]
-    return None
-
-
-async def get_current_user(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    token = authorization.replace("Bearer ", "")
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-    try:
-        user_response = supabase.auth.get_user(token)
-        user = user_response.user
-        if not user:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        profile = get_user_profile(user.id)
-        if not profile:
-            raise HTTPException(status_code=403, detail="Profile not completed")
-        return profile
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
 
 
 # ===== APP =====
@@ -88,30 +67,38 @@ def health_check():
 
 
 # ===== AUTH PROFILE ENDPOINTS =====
-# OAuth is now handled natively in the mobile app via Supabase SDK
-# These endpoints remain for profile management after authentication
 
 @app.post("/auth/complete-profile", response_model=UserProfile)
 def complete_profile(profile_data: CompleteProfileRequest, authorization: str = Header(...)):
     """
     Complete user profile after first login.
-    Called from the mobile app after user authenticates with Google.
+    Uses user's token for RLS context.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
+    
     valid_roles = ['elderly', 'family_supervisor', 'professional']
     if profile_data.role not in valid_roles:
-        raise HTTPException(status_code=400, detail=f"Invalid role")
+        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {valid_roles}")
+    
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
+    
     token = authorization.replace("Bearer ", "")
+    
     try:
+        # Verify user token
         user_response = supabase.auth.get_user(token)
         user = user_response.user
         if not user:
             raise HTTPException(status_code=401, detail="Invalid token")
-        existing = get_user_profile(user.id)
-        if existing:
+        
+        # Create user-authenticated client for RLS
+        user_client = get_user_client(token)
+        
+        # Check if profile already exists
+        existing = user_client.table("users").select("*").eq("id", user.id).execute()
+        if existing.data and len(existing.data) > 0:
             raise HTTPException(status_code=400, detail="Profile already exists")
         
         # Get metadata from Google OAuth
@@ -124,9 +111,13 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
             "phone": profile_data.phone,
             "role": profile_data.role
         }
-        result = supabase.table("users").insert(new_user).execute()
+        
+        # Insert with user's RLS context
+        result = user_client.table("users").insert(new_user).execute()
+        
         if not result.data:
             raise HTTPException(status_code=500, detail="Failed to create profile")
+        
         created = result.data[0]
         return UserProfile(
             id=created["id"],
@@ -143,13 +134,39 @@ def complete_profile(profile_data: CompleteProfileRequest, authorization: str = 
 
 
 @app.get("/auth/me", response_model=UserProfile)
-def get_me(current_user=Depends(get_current_user)):
+def get_me(authorization: str = Header(...)):
     """Get current authenticated user's profile."""
-    return UserProfile(
-        id=current_user["id"],
-        email=current_user["email"],
-        full_name=current_user["full_name"],
-        avatar_url=current_user.get("avatar_url"),
-        phone=current_user.get("phone"),
-        role=current_user["role"]
-    )
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    
+    token = authorization.replace("Bearer ", "")
+    
+    try:
+        user_response = supabase.auth.get_user(token)
+        user = user_response.user
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        # Create user-authenticated client for RLS
+        user_client = get_user_client(token)
+        
+        result = user_client.table("users").select("*").eq("id", user.id).execute()
+        if not result.data or len(result.data) == 0:
+            raise HTTPException(status_code=404, detail="Profile not found")
+        
+        profile = result.data[0]
+        return UserProfile(
+            id=profile["id"],
+            email=profile["email"],
+            full_name=profile["full_name"],
+            avatar_url=profile.get("avatar_url"),
+            phone=profile.get("phone"),
+            role=profile["role"]
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
